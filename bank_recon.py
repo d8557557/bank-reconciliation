@@ -1,27 +1,39 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""銀行匯款對帳 — 把官網「匯款訂單」CSV 整理進銀行匯款對帳總表。
+"""銀行匯款對帳 — 把官網「匯款訂單」CSV 整理進銀行匯款對帳總表，並可推送到線上 Google 試算表。
 
 用法:
+    # 只做本機總表
     python bank_recon.py <匯款訂單.csv> [--total 對帳總表.xlsx] [--dept 電圖部]
+
+    # 回填客戶代號
     python bank_recon.py <匯款訂單.csv> --lookup "客戶訂單+代號_銷貨明細.xlsx"
-    python bank_recon.py --lookup "客戶訂單+代號_銷貨明細.xlsx"   # 只補客戶代號
+
+    # 推到線上 Google 試算表（需先設定 bank_recon.config.json）
+    python bank_recon.py <匯款訂單.csv> --lookup "..." --push
+    python bank_recon.py --push-all          # 把總表全部資料列推上去
 """
 import argparse
 import csv
+import json
 import os
 import re
 import sys
-from datetime import datetime
+import urllib.request
+from datetime import datetime, date
 
 import openpyxl
 from openpyxl.styles import Alignment
+from openpyxl.utils import get_column_letter
 
 SHEET_NAME = '銀行匯款對帳'
 CORE_HEADERS = ['交易日', '存款金額', '摘要', '備註', '部門', '網站訂單編號', '賣家備註']
 CUST_HEADER = '客戶代號'
 ENCODINGS = ['cp950', 'big5', 'utf-8-sig', 'utf-8']
 DEFAULT_TOTAL = '銀行匯款對帳資料-總表.xlsx'
+CONFIG_NAME = 'bank_recon.config.json'
+PUSH_COLS = 7            # 只推 A~G（賣家備註不推）
+WEBAPP_COLS = 7
 
 
 # ---------------------------------------------------------------- CSV 讀取
@@ -206,7 +218,7 @@ def apply_lookup(ws, lookup_path):
         elif o:
             missed.append((i, o))
 
-    ws.column_dimensions[openpyxl.utils.get_column_letter(pos)].width = 14
+    ws.column_dimensions[get_column_letter(pos)].width = 14
     return {
         'lookup': len(look),
         'conflicts': conflicts,
@@ -216,19 +228,58 @@ def apply_lookup(ws, lookup_path):
     }
 
 
+# ---------------------------------------------------------------- 線上推送
+def load_config():
+    path = os.path.join(os.getcwd(), CONFIG_NAME)
+    if os.path.exists(path):
+        with open(path, encoding='utf-8') as f:
+            return json.load(f)
+    return {}
+
+
+def row_values(ws, start, end, cols=PUSH_COLS):
+    out = []
+    for i in range(start, end + 1):
+        vals = []
+        for c in range(1, cols + 1):
+            v = ws.cell(row=i, column=c).value
+            if isinstance(v, (datetime, date)):
+                vals.append(v.strftime('%Y-%m-%d'))
+            elif v is None:
+                vals.append('')
+            else:
+                vals.append(v)
+        out.append(vals)
+    return out
+
+
+def push_rows(url, token, rows, dry_run=False):
+    payload = json.dumps({'token': token, 'rows': rows, 'dryRun': dry_run}).encode('utf-8')
+    req = urllib.request.Request(
+        url, data=payload,
+        headers={'Content-Type': 'application/json'}, method='POST')
+    with urllib.request.urlopen(req, timeout=120) as r:
+        return json.loads(r.read().decode('utf-8'))
+
+
 # ---------------------------------------------------------------- main
 def main():
-    ap = argparse.ArgumentParser(description='銀行匯款對帳：匯款訂單 CSV → 對帳總表')
+    ap = argparse.ArgumentParser(description='銀行匯款對帳：匯款訂單 CSV → 對帳總表（可推線上）')
     ap.add_argument('csv', nargs='?', help='官網匯出的匯款訂單 CSV')
     ap.add_argument('--total', default=DEFAULT_TOTAL, help='對帳總表檔名')
     ap.add_argument('--dept', default='電圖部', help='部門固定值')
     ap.add_argument('--overwrite', action='store_true', help='清空總表既有資料列後重寫（保留表頭）')
     ap.add_argument('--lookup', help='「客戶訂單｜客戶代號」xlsx，用來比對回填客戶代號')
+    ap.add_argument('--push', action='store_true', help='把本次寫入的資料推到線上 Google 試算表（A~G）')
+    ap.add_argument('--push-all', action='store_true', help='把總表全部資料列推到線上（A~G）')
+    ap.add_argument('--webapp', help='GAS 網頁應用程式網址；沒給就讀 ' + CONFIG_NAME)
+    ap.add_argument('--dry-run', action='store_true', help='只試算不真的寫入線上（搭配 --push）')
     args = ap.parse_args()
 
-    if not args.csv and not args.lookup:
-        ap.error('至少要給 CSV，或加 --lookup 補客戶代號')
+    if not args.csv and not args.lookup and not args.push_all:
+        ap.error('至少要給 CSV，或加 --lookup / --push-all')
 
+    start = None
     try:
         wb, ws = load_or_create(args.total)
 
@@ -271,6 +322,37 @@ def main():
     except PermissionError:
         print('寫入失敗：%s 正被 Excel 開啟，請先關閉再執行。' % args.total)
         return 1
+
+    # ---- 推送到線上 Google 試算表 ----
+    if args.push or args.push_all:
+        cfg = load_config()
+        url = args.webapp or cfg.get('webapp')
+        token = cfg.get('token', '')
+        if not url:
+            print('沒有 webapp 網址：請在 %s 設定 webapp，或使用 --webapp' % CONFIG_NAME)
+            return 1
+        if args.push_all or (not args.csv):
+            send_from = 2
+        else:
+            send_from = start
+        rows_to_push = row_values(ws, send_from, ws.max_row)
+        if not rows_to_push:
+            print('沒有可推送的資料列')
+            return 0
+        try:
+            res = push_rows(url, token, rows_to_push, args.dry_run)
+        except Exception as e:
+            print('推送失敗: %s' % e)
+            return 1
+        if res.get('ok'):
+            print('線上推送%s: 送出 %d 筆 → 新增 %s 筆、跳過(重複) %s 筆  [分頁 %s]'
+                  % ('（試跑，未寫入）' if res.get('dryRun') else '',
+                     res.get('received'), res.get('added'), res.get('skipped'), res.get('sheet')))
+            if res.get('dupKeys'):
+                print('  重複的網站訂單編號: %s' % ', '.join(res['dupKeys']))
+        else:
+            print('線上回報錯誤: %s' % res.get('error'))
+            return 1
 
     return 0
 
