@@ -318,9 +318,14 @@ def main():
             if rep['missed']:
                 print('  未比對到: %s' % rep['missed'])
 
-        wb.save(args.total)
+        if args.csv or args.lookup:
+            try:
+                wb.save(args.total)
+            except PermissionError:
+                print('寫入失敗：%s 正被 Excel 開啟，請先關閉再執行。' % args.total)
+                return 1
     except PermissionError:
-        print('寫入失敗：%s 正被 Excel 開啟，請先關閉再執行。' % args.total)
+        print('讀取失敗：%s 正被 Excel 開啟，請先關閉再執行。' % args.total)
         return 1
 
     # ---- 推送到線上 Google 試算表 ----
