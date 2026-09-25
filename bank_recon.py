@@ -4,6 +4,8 @@
 
 用法:
     python bank_recon.py <匯款訂單.csv> [--total 對帳總表.xlsx] [--dept 電圖部]
+    python bank_recon.py <匯款訂單.csv> --lookup "客戶訂單+代號_銷貨明細.xlsx"
+    python bank_recon.py --lookup "客戶訂單+代號_銷貨明細.xlsx"   # 只補客戶代號
 """
 import argparse
 import csv
@@ -16,10 +18,13 @@ import openpyxl
 from openpyxl.styles import Alignment
 
 SHEET_NAME = '銀行匯款對帳'
-HEADERS = ['交易日', '存款金額', '摘要', '備註', '部門', '網站訂單編號', '賣家備註']
+CORE_HEADERS = ['交易日', '存款金額', '摘要', '備註', '部門', '網站訂單編號', '賣家備註']
+CUST_HEADER = '客戶代號'
 ENCODINGS = ['cp950', 'big5', 'utf-8-sig', 'utf-8']
+DEFAULT_TOTAL = '銀行匯款對帳資料-總表.xlsx'
 
 
+# ---------------------------------------------------------------- CSV 讀取
 def read_csv(path):
     last = None
     for enc in ENCODINGS:
@@ -94,85 +99,179 @@ def parse_records(rows, dept):
         fixed = correct_last5(seller_note)
         if fixed:
             summary = fixed
-        records.append([
-            parse_date(g(row, idx, '匯款日期')),
-            clean_amount(g(row, idx, '匯款金額')),
-            summary,
-            g(row, idx, '匯款銀行'),
-            dept,
-            order_no,
-            seller_note,
-        ])
+        records.append({
+            '交易日': parse_date(g(row, idx, '匯款日期')),
+            '存款金額': clean_amount(g(row, idx, '匯款金額')),
+            '摘要': summary,
+            '備註': g(row, idx, '匯款銀行'),
+            '部門': dept,
+            '網站訂單編號': order_no,
+            '賣家備註': seller_note,
+        })
     return records
 
 
+# ---------------------------------------------------------------- 總表存取
 def load_or_create(path):
     if os.path.exists(path):
         wb = openpyxl.load_workbook(path)
-        if SHEET_NAME in wb.sheetnames:
-            ws = wb[SHEET_NAME]
-        else:
-            ws = wb.create_sheet(SHEET_NAME)
+        ws = wb[SHEET_NAME] if SHEET_NAME in wb.sheetnames else wb.create_sheet(SHEET_NAME)
         if ws.max_row == 0 or ws.cell(row=1, column=1).value is None:
-            ws.append(HEADERS)
+            ws.append(CORE_HEADERS)
         return wb, ws
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = SHEET_NAME
-    ws.append(HEADERS)
+    ws.append(CORE_HEADERS)
     return wb, ws
 
 
-def style_rows(ws, start):
+def col_map(ws):
+    m = {}
+    for i, c in enumerate(ws[1], 1):
+        if c.value not in (None, ''):
+            m[str(c.value).strip()] = i
+    return m
+
+
+def ensure_column(ws, name, after_name):
+    """確保總表有 name 欄；沒有就在 after_name 後面插一欄，回傳欄序號。"""
+    m = col_map(ws)
+    if name in m:
+        return m[name]
+    after = m.get(after_name)
+    pos = (after + 1) if after else ws.max_column + 1
+    ws.insert_cols(pos)
+    ws.cell(row=1, column=pos, value=name)
+    return pos
+
+
+def style_rows(ws, start, cm):
     for i in range(start, ws.max_row + 1):
-        c1 = ws.cell(row=i, column=1)
-        c1.alignment = Alignment(horizontal='center')
-        if c1.value not in (None, ''):
-            c1.number_format = 'yyyy/mm/dd'
-        c2 = ws.cell(row=i, column=2)
-        c2.alignment = Alignment(horizontal='right')
-        if isinstance(c2.value, (int, float)):
-            c2.number_format = '#,##0'
-        c3 = ws.cell(row=i, column=3)
-        if c3.value not in (None, ''):
-            c3.value = str(c3.value)
-            c3.number_format = '@'
-            c3.alignment = Alignment(horizontal='center')
+        if '交易日' in cm:
+            c = ws.cell(row=i, column=cm['交易日'])
+            c.alignment = Alignment(horizontal='center')
+            if c.value not in (None, ''):
+                c.number_format = 'yyyy/mm/dd'
+        if '存款金額' in cm:
+            c = ws.cell(row=i, column=cm['存款金額'])
+            c.alignment = Alignment(horizontal='right')
+            if isinstance(c.value, (int, float)):
+                c.number_format = '#,##0'
+        if '摘要' in cm:
+            c = ws.cell(row=i, column=cm['摘要'])
+            if c.value not in (None, ''):
+                c.value = str(c.value)
+                c.number_format = '@'
+                c.alignment = Alignment(horizontal='center')
 
 
+# ---------------------------------------------------------------- 客戶代號
+def build_lookup(path):
+    """讀『客戶訂單 | 客戶代號』xlsx，回傳 {客戶訂單: 客戶代號} 與衝突數。"""
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    ws = wb.worksheets[0]
+    look = {}
+    conflicts = 0
+    for order, code in ws.iter_rows(min_row=2, values_only=True):
+        if order is None or code is None:
+            continue
+        o = str(order).strip()
+        c = str(code).strip()
+        if not o:
+            continue
+        if o in look and look[o] != c:
+            conflicts += 1
+        look[o] = c
+    wb.close()
+    return look, conflicts
+
+
+def apply_lookup(ws, lookup_path):
+    look, conflicts = build_lookup(lookup_path)
+    pos = ensure_column(ws, CUST_HEADER, '網站訂單編號')
+    cm = col_map(ws)
+    order_pos = cm.get('網站訂單編號')
+    if order_pos is None:
+        raise SystemExit('總表找不到「網站訂單編號」欄，無法比對客戶代號')
+
+    matched, missed = 0, []
+    for i in range(2, ws.max_row + 1):
+        v = ws.cell(row=i, column=order_pos).value
+        o = str(v).strip() if v is not None else ''
+        code = look.get(o, '')
+        ws.cell(row=i, column=pos, value=code if code else None)
+        if code:
+            matched += 1
+        elif o:
+            missed.append((i, o))
+
+    ws.column_dimensions[openpyxl.utils.get_column_letter(pos)].width = 14
+    return {
+        'lookup': len(look),
+        'conflicts': conflicts,
+        'matched': matched,
+        'total': ws.max_row - 1,
+        'missed': missed,
+    }
+
+
+# ---------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser(description='銀行匯款對帳：匯款訂單 CSV → 對帳總表')
-    ap.add_argument('csv', help='官網匯出的匯款訂單 CSV')
-    ap.add_argument('--total', default='銀行匯款對帳資料-總表.xlsx', help='對帳總表檔名')
+    ap.add_argument('csv', nargs='?', help='官網匯出的匯款訂單 CSV')
+    ap.add_argument('--total', default=DEFAULT_TOTAL, help='對帳總表檔名')
     ap.add_argument('--dept', default='電圖部', help='部門固定值')
     ap.add_argument('--overwrite', action='store_true', help='清空總表既有資料列後重寫（保留表頭）')
+    ap.add_argument('--lookup', help='「客戶訂單｜客戶代號」xlsx，用來比對回填客戶代號')
     args = ap.parse_args()
 
-    rows, enc = read_csv(args.csv)
-    if not rows:
-        print('CSV 是空的'); return 1
-    records = parse_records(rows, args.dept)
-    if not records:
-        print('沒有可輸出的資料'); return 1
+    if not args.csv and not args.lookup:
+        ap.error('至少要給 CSV，或加 --lookup 補客戶代號')
 
     try:
         wb, ws = load_or_create(args.total)
-        if args.overwrite and ws.max_row > 1:
-            ws.delete_rows(2, ws.max_row - 1)
-        start = ws.max_row + 1
-        for rec in records:
-            ws.append(rec)
-        style_rows(ws, start)
+
+        if args.csv:
+            rows, enc = read_csv(args.csv)
+            if not rows:
+                print('CSV 是空的'); return 1
+            records = parse_records(rows, args.dept)
+            if not records:
+                print('沒有可輸出的資料'); return 1
+
+            if args.overwrite and ws.max_row > 1:
+                ws.delete_rows(2, ws.max_row - 1)
+
+            if args.lookup:
+                ensure_column(ws, CUST_HEADER, '網站訂單編號')
+            cm = col_map(ws)
+            start = ws.max_row + 1
+            for rec in records:
+                r = ws.max_row + 1
+                for name, val in rec.items():
+                    if name in cm:
+                        ws.cell(row=r, column=cm[name], value=val)
+            style_rows(ws, start, cm)
+
+            fixed = sum(1 for r in records if correct_last5(r['賣家備註']))
+            print('來源: %s（編碼 %s）' % (os.path.basename(args.csv), enc))
+            print('寫入 %d 筆 → %s（第 %d~%d 列）' % (len(records), args.total, start, ws.max_row))
+            if fixed:
+                print('摘要以「正確後5碼」覆蓋: %d 筆' % fixed)
+
+        if args.lookup:
+            rep = apply_lookup(ws, args.lookup)
+            print('客戶代號比對: 查找表 %d 筆（衝突 %d）→ 帶入 %d/%d 列'
+                  % (rep['lookup'], rep['conflicts'], rep['matched'], rep['total']))
+            if rep['missed']:
+                print('  未比對到: %s' % rep['missed'])
+
         wb.save(args.total)
     except PermissionError:
         print('寫入失敗：%s 正被 Excel 開啟，請先關閉再執行。' % args.total)
         return 1
 
-    fixed = sum(1 for r in records if correct_last5(r[6]))
-    print('來源: %s（編碼 %s）' % (os.path.basename(args.csv), enc))
-    print('寫入 %d 筆 → %s（第 %d~%d 列）' % (len(records), args.total, start, ws.max_row))
-    if fixed:
-        print('摘要以「正確後5碼」覆蓋: %d 筆' % fixed)
     return 0
 
 
